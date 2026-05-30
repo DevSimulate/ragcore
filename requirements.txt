@@ -1,0 +1,39 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# LangChain (split packages — correct 2025 pattern)
+langchain-core==0.3.25
+langchain-community==0.3.12
+langchain-openai==0.2.14
+langchain-text-splitters==0.3.3
+
+# Vector store
+chromadb==0.5.20
+
+# Embeddings
+sentence-transformers==3.3.1
+tiktoken==0.8.0
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Cache
+redis==5.2.1
+
+# File processing
+pypdf==5.1.0
+python-multipart==0.0.18
+aiofiles==24.1.0
+
+# HTTP
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+httpx==0.28.1

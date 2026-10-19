@@ -88,17 +88,36 @@ class DocumentProcessor:
         with open(tmp_path, "wb") as f:
             f.write(content)
 
+        return await self.process_path(tmp_path, filename, document_id)
+
+    def _compute_file_checksum(self, file_path: str, chunk_size: int = 1024 * 1024) -> str:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for block in iter(lambda: f.read(chunk_size), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    async def process_path(
+        self,
+        file_path: str,
+        filename: str,
+        document_id: str,
+    ) -> list[Document]:
+        """Process a file already on disk without loading it fully into memory."""
+        suffix = Path(filename).suffix.lower()
+
         if suffix == ".pdf":
-            raw_docs = self.load_pdf(tmp_path)
+            raw_docs = self.load_pdf(file_path)
         elif suffix in (".docx", ".doc"):
-            raw_docs = self.load_docx(tmp_path)
+            raw_docs = self.load_docx(file_path)
         else:
             raise ValueError(f"Unsupported file type: {suffix}")
 
+        checksum = self._compute_file_checksum(file_path)
         for doc in raw_docs:
             doc.metadata["document_id"] = document_id
             doc.metadata["filename"] = filename
-            doc.metadata["checksum"] = self._compute_checksum(content)
+            doc.metadata["checksum"] = checksum
 
         chunks = self.chunk_documents(raw_docs)
         logger.info(

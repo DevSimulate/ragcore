@@ -1,11 +1,16 @@
 import logging
+import os
+import tempfile
 import uuid
+from pathlib import Path
 
+import aiofiles
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.api.deps import get_db, get_current_tenant
+from app.core.config import settings
 from app.models.document import Document as DocumentModel
 from app.services.document_processor import DocumentProcessor
 from app.services.vector_store import VectorStoreService
@@ -22,30 +27,62 @@ ALLOWED_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
+def _upload_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=f"File too large. Maximum upload size is {settings.MAX_UPLOAD_SIZE_MB} MB.",
+    )
+
+
+async def _save_upload_to_temp(file: UploadFile, max_bytes: int) -> tuple[str, int]:
+    """Stream an upload to a temp file in chunks. Returns (path, size_bytes)."""
+    suffix = Path(file.filename or "").suffix.lower()
+    fd, tmp_path = tempfile.mkstemp(prefix="ragcore_", suffix=suffix)
+    os.close(fd)
+
+    size = 0
+    try:
+        async with aiofiles.open(tmp_path, "wb") as out:
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise _upload_too_large()
+                await out.write(chunk)
+    except BaseException:
+        _remove_temp_file(tmp_path)
+        raise
+
+    return tmp_path, size
+
+
+def _remove_temp_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not delete temp file %s: %s", path, exc)
+
 
 async def _run_ingestion(
-    content: bytes,
+    file_path: str,
     filename: str,
     document_id: str,
     tenant_id: str,
 ) -> None:
-    # BUG (RAG-15): The entire file is loaded into `content` (bytes) before this
-    # background task runs. For large files (200 MB+), the HTTP request handler
-    # calls `await file.read()` which blocks the event loop loading all bytes into
-    # memory, THEN spawns this task. Two concurrent large-file uploads double
-    # memory pressure before any processing begins.
-    #
-    # Additionally, if document_processor.process_file() raises mid-way (e.g. a
+    # BUG (RAG-15, remaining): If document_processor.process_file() raises mid-way (e.g. a
     # corrupt PDF that fails on page 40 of 60), the partially-processed chunks
     # that were already added to ChromaDB are never rolled back. The document
     # record in Postgres shows status="processing" permanently, and the partial
     # chunks are queryable but incomplete.
     #
-    # Fix: stream the upload to a temp file on disk using aiofiles, then process
-    # from disk. Wrap vector_store.add_documents() and the DB status update in a
+    # Fix: wrap vector_store.add_documents() and the DB status update in a
     # compensating transaction that deletes partial ChromaDB chunks on failure.
     try:
-        chunks = await _processor.process_file(content, filename, document_id)
+        chunks = await _processor.process_path(file_path, filename, document_id)
         await _vector_store.add_documents(chunks, tenant_id=tenant_id)
 
         async with get_db() as db:
@@ -66,6 +103,8 @@ async def _run_ingestion(
                     await db.commit()
         except Exception:
             pass
+    finally:
+        _remove_temp_file(file_path)
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=202)
@@ -81,24 +120,33 @@ async def upload_document(
             detail="Unsupported file type. Upload PDF or DOCX.",
         )
 
-    document_id = str(uuid.uuid4())
-    content = await file.read()
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if file.size is not None and file.size > max_bytes:
+        raise _upload_too_large()
 
-    doc = DocumentModel(
-        id=document_id,
-        filename=file.filename,
-        tenant_id=tenant_id,
-        size_bytes=len(content),
-        status="processing",
-        chunk_count=0,
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
+    document_id = str(uuid.uuid4())
+    # file.size may be unknown, so the chunked copy also enforces the limit.
+    tmp_path, size_bytes = await _save_upload_to_temp(file, max_bytes)
+
+    try:
+        doc = DocumentModel(
+            id=document_id,
+            filename=file.filename,
+            tenant_id=tenant_id,
+            size_bytes=size_bytes,
+            status="processing",
+            chunk_count=0,
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+    except BaseException:
+        _remove_temp_file(tmp_path)
+        raise
 
     background_tasks.add_task(
         _run_ingestion,
-        content=content,
+        file_path=tmp_path,
         filename=file.filename,
         document_id=document_id,
         tenant_id=tenant_id,

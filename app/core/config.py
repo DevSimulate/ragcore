@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = ["http://localhost:3000"]
     api_key_header: str = "X-API-Key"
 
+    MAX_UPLOAD_SIZE_MB: int = 100
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
